@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "name": "today-oa",
+  "version": "0.1.0",
+  "channel": "stable",
+  "updateManifestUrl": "https://raw.githubusercontent.com/Today-Operation/today-oa-skills/main/releases/stable.json"
+}

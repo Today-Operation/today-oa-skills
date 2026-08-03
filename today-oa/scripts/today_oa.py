@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""Public Today OA device client using per-user Google Workspace identity."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from pathlib import Path
+from typing import Any
+
+API_URL = os.environ.get("TODAY_OA_API_URL", "https://oa-platform-3nj9aw3w.an.gateway.dev").rstrip("/")
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+PUBLIC_OAUTH_CONFIG = json.loads(
+    (SKILL_ROOT / "references" / "oauth-client.json").read_text(encoding="utf-8")
+)
+LOCAL_RELEASE = json.loads((SKILL_ROOT / "references" / "release.json").read_text(encoding="utf-8"))
+GOOGLE_CLIENT_ID = os.environ.get("TODAY_OA_GOOGLE_CLIENT_ID", str(PUBLIC_OAUTH_CONFIG["client_id"]))
+
+
+def default_state_dir(skill_root: Path = SKILL_ROOT) -> Path:
+    community_root = Path("/home/user/.today/skills/community")
+    try:
+        skill_root.relative_to(community_root)
+        return community_root / ".state" / "today-oa"
+    except ValueError:
+        return Path.home() / ".today-oa"
+
+
+STATE_DIR = Path(os.environ.get("TODAY_OA_STATE_DIR", str(default_state_dir())))
+TOKEN_FILE = STATE_DIR / "auth.json"
+DEVICE_FILE = STATE_DIR / "device.json"
+CONFIRMATION_FILE = STATE_DIR / "confirmations.json"
+UPDATE_CACHE_FILE = STATE_DIR / "update-check.json"
+UPDATE_LOCK_FILE = STATE_DIR / "update.lock"
+UPDATE_LOG_FILE = STATE_DIR / "update.log"
+SCOPES = "openid email profile"
+UPDATE_CHECK_TTL_SECONDS = 6 * 60 * 60
+UPDATE_MANIFEST_URL = str(LOCAL_RELEASE["updateManifestUrl"])
+WRITE_ACTIONS = {
+    "create_extra_request",
+    "create_and_submit_extra_request",
+    "update_request",
+    "submit_request",
+    "withdraw_request",
+    "request_return",
+    "approve_request",
+    "reject_request",
+    "request_changes",
+}
+
+
+class ClientError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def canonical_action(action_input: dict[str, Any]) -> str:
+    normalized = dict(action_input)
+    normalized.pop("confirmationToken", None)
+    normalized["confirmed"] = False
+    return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def action_fingerprint(action_input: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_action(action_input).encode()).hexdigest()
+
+
+def record_confirmation(token: str, action_input: dict[str, Any]) -> None:
+    try:
+        confirmations = read_json(CONFIRMATION_FILE)
+    except ClientError:
+        confirmations = {}
+    now = int(time.time())
+    current = {
+        key: value for key, value in confirmations.items()
+        if isinstance(value, dict) and int(value.get("expiresAt", 0)) > now
+    }
+    current[token] = {
+        "fingerprint": action_fingerprint(action_input),
+        "expiresAt": now + 15 * 60,
+    }
+    write_private(CONFIRMATION_FILE, current)
+
+
+def validate_confirmation(token: str, action_input: dict[str, Any]) -> None:
+    try:
+        confirmations = read_json(CONFIRMATION_FILE)
+    except ClientError:
+        raise ClientError("CONFIRMATION_REQUIRED", "Preview this exact action and ask the user to confirm it again") from None
+    saved = confirmations.get(token)
+    if not isinstance(saved, dict) or int(saved.get("expiresAt", 0)) <= int(time.time()):
+        raise ClientError("CONFIRMATION_EXPIRED", "The confirmation expired; preview the action again")
+    if not secrets.compare_digest(str(saved.get("fingerprint", "")), action_fingerprint(action_input)):
+        raise ClientError("CONFIRMATION_MISMATCH", "The confirmed action differs from the preview")
+
+
+def consume_confirmation(token: str) -> None:
+    try:
+        confirmations = read_json(CONFIRMATION_FILE)
+    except ClientError:
+        return
+    confirmations.pop(token, None)
+    write_private(CONFIRMATION_FILE, confirmations)
+
+
+def request_json(url: str, *, data: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    encoded = None if data is None else urllib.parse.urlencode(data).encode()
+    request = urllib.request.Request(url, data=encoded, headers=headers or {}, method="POST" if data is not None else "GET")
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode())
+            if not isinstance(payload, dict):
+                raise ClientError("INVALID_RESPONSE", "OA returned an invalid response")
+            return payload
+    except urllib.error.HTTPError as error:
+        try:
+            payload = json.loads(error.read().decode())
+            detail = payload.get("error", payload) if isinstance(payload, dict) else {}
+            if isinstance(detail, str):
+                code = detail
+                message = str(payload.get("error_description", detail))
+            elif isinstance(detail, dict):
+                code = str(detail.get("code", "HTTP_ERROR"))
+                message = str(detail.get("message", "Request failed"))
+            else:
+                code, message = "HTTP_ERROR", "Request failed"
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            code, message = "HTTP_ERROR", "Request failed"
+        raise ClientError(code, message) from None
+    except urllib.error.URLError as error:
+        raise ClientError("NETWORK_ERROR", f"Unable to reach OA: {error.reason}") from None
+
+
+def broker_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    request = urllib.request.Request(
+        f"{API_URL}{path}",
+        data=json.dumps(payload).encode(),
+        headers={"content-type": "application/json", "x-oa-source": "skill"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        try:
+            body = json.loads(error.read().decode())
+            detail = body.get("error", body) if isinstance(body, dict) else {}
+            code = str(detail.get("code", "GOOGLE_AUTH_FAILED")) if isinstance(detail, dict) else "GOOGLE_AUTH_FAILED"
+            message = str(detail.get("message", "Google authentication failed")) if isinstance(detail, dict) else "Google authentication failed"
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            code, message = "GOOGLE_AUTH_FAILED", "Google authentication failed"
+        raise ClientError(code, message) from None
+    except urllib.error.URLError as error:
+        raise ClientError("NETWORK_ERROR", f"Unable to reach OA: {error.reason}") from None
+    if not isinstance(result, dict):
+        raise ClientError("INVALID_RESPONSE", "OA returned an invalid authentication response")
+    return result
+
+
+def write_private(path: Path, payload: dict[str, Any]) -> None:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temporary.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    temporary.replace(path)
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError
+        return payload
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        raise ClientError("LOGIN_REQUIRED", "Google Workspace login is required") from None
+
+
+def require_oauth_config() -> None:
+    if not GOOGLE_CLIENT_ID:
+        raise ClientError("OAUTH_NOT_CONFIGURED", "The installed Skill is missing its Google OAuth public client configuration")
+
+
+def auth_start() -> dict[str, Any]:
+    require_oauth_config()
+    payload = request_json(
+        "https://oauth2.googleapis.com/device/code",
+        data={"client_id": GOOGLE_CLIENT_ID, "scope": SCOPES},
+    )
+    verification_url = payload.get("verification_url") or payload.get("verification_uri")
+    required = ("device_code", "user_code", "expires_in", "interval")
+    if any(key not in payload for key in required):
+        raise ClientError("INVALID_RESPONSE", "Google returned an incomplete device authorization response")
+    if not isinstance(verification_url, str):
+        raise ClientError("INVALID_RESPONSE", "Google did not return an authorization URL")
+    write_private(DEVICE_FILE, {
+        "device_code": payload["device_code"],
+        "expires_at": int(time.time()) + int(payload["expires_in"]),
+        "interval": int(payload["interval"]),
+    })
+    return {
+        "status": "authorization_required",
+        "verification_url": verification_url,
+        "user_code": payload["user_code"],
+        "expires_in": payload["expires_in"],
+    }
+
+
+def auth_finish() -> dict[str, Any]:
+    require_oauth_config()
+    device = read_json(DEVICE_FILE)
+    if int(device.get("expires_at", 0)) <= int(time.time()):
+        raise ClientError("AUTHORIZATION_EXPIRED", "Google authorization expired; start again")
+    try:
+        tokens = broker_json(
+            "/v1/auth/google-device/token",
+            {"deviceCode": device["device_code"]},
+        )
+    except ClientError as error:
+        if error.code in {"authorization_pending", "slow_down"}:
+            return {"status": "authorization_pending", "retry_after": int(device.get("interval", 5))}
+        raise
+    if tokens.get("status") in {"authorization_pending", "slow_down"}:
+        return {"status": "authorization_pending", "retry_after": int(device.get("interval", 5))}
+    if not isinstance(tokens.get("idToken"), str) or not isinstance(tokens.get("refreshToken"), str):
+        raise ClientError("INVALID_RESPONSE", "Google did not return the required identity tokens")
+    write_private(TOKEN_FILE, {
+        "id_token": tokens["idToken"],
+        "refresh_token": tokens["refreshToken"],
+        "expires_at": int(time.time()) + int(tokens.get("expiresIn", 3600)),
+    })
+    DEVICE_FILE.unlink(missing_ok=True)
+    return {"status": "authenticated"}
+
+
+def refresh_tokens(tokens: dict[str, Any]) -> dict[str, Any]:
+    require_oauth_config()
+    refresh_token = tokens.get("refresh_token")
+    if not isinstance(refresh_token, str):
+        raise ClientError("LOGIN_REQUIRED", "Google Workspace login is required")
+    refreshed = broker_json(
+        "/v1/auth/google-device/refresh",
+        {"refreshToken": refresh_token},
+    )
+    if not isinstance(refreshed.get("idToken"), str):
+        raise ClientError("LOGIN_REQUIRED", "Google login must be renewed")
+    updated = {
+        "id_token": refreshed["idToken"],
+        "refresh_token": refreshed.get("refreshToken", refresh_token),
+        "expires_at": int(time.time()) + int(refreshed.get("expiresIn", 3600)),
+    }
+    write_private(TOKEN_FILE, updated)
+    return updated
+
+
+def active_id_token() -> str:
+    tokens = read_json(TOKEN_FILE)
+    if int(tokens.get("expires_at", 0)) <= int(time.time()) + 60:
+        tokens = refresh_tokens(tokens)
+    id_token = tokens.get("id_token")
+    if not isinstance(id_token, str):
+        raise ClientError("LOGIN_REQUIRED", "Google Workspace login is required")
+    return id_token
+
+
+def read_update_manifest(*, force: bool = False) -> dict[str, Any]:
+    now = int(time.time())
+    if not force:
+        try:
+            cached = read_json(UPDATE_CACHE_FILE)
+            if now - int(cached.get("checkedAt", 0)) < UPDATE_CHECK_TTL_SECONDS:
+                manifest = cached.get("manifest")
+                if isinstance(manifest, dict):
+                    return manifest
+        except ClientError:
+            pass
+
+    request = urllib.request.Request(
+        UPDATE_MANIFEST_URL,
+        headers={"Accept": "application/json", "User-Agent": "Today-OA-Skill-Updater"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            manifest = json.loads(response.read().decode())
+    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ClientError("UPDATE_CHECK_FAILED", f"Unable to check for a Today OA update: {error}") from None
+    if not isinstance(manifest, dict):
+        raise ClientError("INVALID_UPDATE_MANIFEST", "Today OA returned an invalid update manifest")
+    required = {"schemaVersion", "name", "version", "downloadUrl", "sha256"}
+    if not required.issubset(manifest) or manifest.get("name") != "today-oa":
+        raise ClientError("INVALID_UPDATE_MANIFEST", "Today OA returned an incomplete update manifest")
+    write_private(UPDATE_CACHE_FILE, {"checkedAt": now, "manifest": manifest})
+    return manifest
+
+
+def start_background_update() -> bool:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        lock_fd = os.open(UPDATE_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return False
+    os.close(lock_fd)
+    try:
+        with UPDATE_LOG_FILE.open("ab") as log:
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "update", "--wait", "--background-worker"],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError:
+        UPDATE_LOCK_FILE.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def update_status(*, force: bool = False, auto_update: bool = True) -> dict[str, Any]:
+    current = str(LOCAL_RELEASE["version"])
+    try:
+        manifest = read_update_manifest(force=force)
+    except ClientError as error:
+        return {
+            "status": "unknown",
+            "currentVersion": current,
+            "error": error.code,
+            "message": str(error),
+        }
+    latest = str(manifest["version"])
+    status = "up_to_date" if latest == current else "update_available"
+    if status == "update_available" and auto_update:
+        status = "update_started" if start_background_update() else "update_in_progress"
+    return {
+        "status": status,
+        "currentVersion": current,
+        "latestVersion": latest,
+    }
+
+
+def validate_release_url(url: str) -> None:
+    parsed = urllib.parse.urlparse(url)
+    expected_prefix = "/Today-Operation/today-oa-skills/releases/download/"
+    if parsed.scheme != "https" or parsed.netloc != "github.com" or not parsed.path.startswith(expected_prefix):
+        raise ClientError("UNTRUSTED_UPDATE_SOURCE", "The update is not from the official Today OA release location")
+
+
+def safe_extract_release(archive: Path, destination: Path) -> Path:
+    with zipfile.ZipFile(archive) as package:
+        for member in package.infolist():
+            target = (destination / member.filename).resolve()
+            try:
+                target.relative_to(destination.resolve())
+            except ValueError:
+                raise ClientError("INVALID_UPDATE_PACKAGE", "The update package contains an unsafe path") from None
+        package.extractall(destination)
+    candidate = destination / "today-oa"
+    required = [
+        candidate / "SKILL.md",
+        candidate / "scripts" / "today_oa.py",
+        candidate / "references" / "release.json",
+        candidate / "references" / "oauth-client.json",
+    ]
+    if not all(path.is_file() for path in required):
+        raise ClientError("INVALID_UPDATE_PACKAGE", "The update package is incomplete")
+    return candidate
+
+
+def apply_update() -> dict[str, Any]:
+    manifest = read_update_manifest(force=True)
+    current = str(LOCAL_RELEASE["version"])
+    latest = str(manifest["version"])
+    if latest == current:
+        return {"status": "up_to_date", "version": current}
+
+    download_url = str(manifest["downloadUrl"])
+    validate_release_url(download_url)
+    with tempfile.TemporaryDirectory(prefix="today-oa-update-", dir=str(SKILL_ROOT.parent)) as temporary_dir:
+        temporary = Path(temporary_dir)
+        archive = temporary / "release.zip"
+        try:
+            request = urllib.request.Request(download_url, headers={"User-Agent": "Today-OA-Skill-Updater"})
+            with urllib.request.urlopen(request, timeout=20) as response, archive.open("wb") as output:
+                shutil.copyfileobj(response, output)
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as error:
+            raise ClientError("UPDATE_DOWNLOAD_FAILED", f"Unable to download the Today OA update: {error}") from None
+        actual_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if not secrets.compare_digest(actual_hash, str(manifest["sha256"])):
+            raise ClientError("UPDATE_INTEGRITY_FAILED", "The Today OA update package failed integrity verification")
+        candidate = safe_extract_release(archive, temporary / "extracted")
+        candidate_release = json.loads((candidate / "references" / "release.json").read_text(encoding="utf-8"))
+        if candidate_release.get("name") != "today-oa" or str(candidate_release.get("version")) != latest:
+            raise ClientError("INVALID_UPDATE_PACKAGE", "The update package version does not match its manifest")
+
+        backup = SKILL_ROOT.parent / ".today-oa.rollback"
+        if backup.exists():
+            shutil.rmtree(backup)
+        SKILL_ROOT.replace(backup)
+        try:
+            candidate.replace(SKILL_ROOT)
+        except OSError:
+            backup.replace(SKILL_ROOT)
+            raise ClientError("UPDATE_INSTALL_FAILED", "Unable to activate the Today OA update") from None
+        shutil.rmtree(backup, ignore_errors=True)
+    return {"status": "updated", "previousVersion": current, "version": latest}
+
+
+def execute(action_input: dict[str, Any]) -> dict[str, Any]:
+    action_input = dict(action_input)
+    action = action_input.get("action")
+    if not isinstance(action, str):
+        raise ClientError("INVALID_INPUT", "action is required")
+    is_write = action in WRITE_ACTIONS
+    confirmed = action_input.get("confirmed") is True
+    confirmation_token = action_input.pop("confirmationToken", None)
+    if is_write and confirmed and not isinstance(confirmation_token, str):
+        raise ClientError("CONFIRMATION_REQUIRED", "confirmationToken is required for a confirmed write")
+    if is_write and confirmed:
+        validate_confirmation(confirmation_token, action_input)
+
+    body = json.dumps({**action_input, "confirmed": confirmed}, ensure_ascii=False).encode()
+    headers = {
+        "authorization": f"Bearer {active_id_token()}",
+        "content-type": "application/json",
+        "x-oa-source": "skill",
+    }
+    if is_write and confirmed:
+        headers["idempotency-key"] = f"skill:{confirmation_token}"
+    request = urllib.request.Request(
+        f"{API_URL}/v1/company-assets/integrations/today/company-asset",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        try:
+            payload = json.loads(error.read().decode())
+            detail = payload.get("error", payload) if isinstance(payload, dict) else {}
+            raise ClientError(str(detail.get("code", "HTTP_ERROR")), str(detail.get("message", "OA request failed")))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise ClientError("HTTP_ERROR", "OA request failed") from None
+    except urllib.error.URLError as error:
+        raise ClientError("NETWORK_ERROR", f"Unable to reach OA: {error.reason}") from None
+    if not isinstance(result, dict):
+        raise ClientError("INVALID_RESPONSE", "OA returned an invalid response")
+    if is_write and not confirmed and result.get("status") == "confirmation_required":
+        result["confirmationToken"] = secrets.token_hex(16)
+        record_confirmation(result["confirmationToken"], action_input)
+    if is_write and confirmed:
+        consume_confirmation(confirmation_token)
+    return result
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Today OA workflow client")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("auth-start")
+    subparsers.add_parser("auth-finish")
+    subparsers.add_parser("auth-status")
+    subparsers.add_parser("logout")
+    update_status_parser = subparsers.add_parser("update-status")
+    update_status_parser.add_argument("--force", action="store_true")
+    update_parser = subparsers.add_parser("update")
+    update_parser.add_argument("--wait", action="store_true", help="wait for the verified update to finish")
+    update_parser.add_argument("--background-worker", action="store_true", help=argparse.SUPPRESS)
+    subparsers.add_parser("version")
+    execute_parser = subparsers.add_parser("execute")
+    execute_parser.add_argument("--input-json", required=True)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_arguments()
+    try:
+        if args.command == "auth-start":
+            result = auth_start()
+        elif args.command == "auth-finish":
+            result = auth_finish()
+        elif args.command == "auth-status":
+            try:
+                active_id_token()
+                result = {"status": "authenticated"}
+            except ClientError as error:
+                if error.code == "OAUTH_NOT_CONFIGURED":
+                    result = {"status": "setup_required"}
+                elif error.code == "LOGIN_REQUIRED":
+                    result = {"status": "login_required"}
+                else:
+                    raise
+        elif args.command == "logout":
+            TOKEN_FILE.unlink(missing_ok=True)
+            DEVICE_FILE.unlink(missing_ok=True)
+            CONFIRMATION_FILE.unlink(missing_ok=True)
+            result = {"status": "logged_out"}
+        elif args.command == "update-status":
+            result = update_status(force=args.force)
+        elif args.command == "update":
+            if not args.wait:
+                raise ClientError("EXPLICIT_WAIT_REQUIRED", "Run update with --wait so completion can be verified")
+            try:
+                result = apply_update()
+            finally:
+                if args.background_worker:
+                    UPDATE_LOCK_FILE.unlink(missing_ok=True)
+        elif args.command == "version":
+            result = {"name": "today-oa", "version": str(LOCAL_RELEASE["version"])}
+        else:
+            parsed = json.loads(args.input_json)
+            if not isinstance(parsed, dict):
+                raise ClientError("INVALID_INPUT", "input JSON must be an object")
+            result = execute(parsed)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    except json.JSONDecodeError:
+        error = ClientError("INVALID_INPUT", "input JSON is invalid")
+    except ClientError as caught:
+        error = caught
+    print(json.dumps({"ok": False, "error": error.code, "message": str(error)}, ensure_ascii=False))
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

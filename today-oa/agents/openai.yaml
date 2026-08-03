@@ -1,0 +1,4 @@
+interface:
+  display_name: "Today OA"
+  short_description: "在 Today 中发起、查询和审批公司内部业务流程"
+  default_prompt: "使用 $today-oa 查看我可以发起的公司内部流程。"
