@@ -75,6 +75,8 @@ COMMON_APPLICATION_ACTIONS = {
     "reject_request",
     "request_changes",
 }
+ASSET_REQUEST_BUSINESS_TYPE = "asset_request"
+ASSET_REQUEST_FORM_KEY = "asset_request"
 
 
 class ClientError(Exception):
@@ -578,7 +580,7 @@ def common_execute(action_input: dict[str, Any], confirmation_token: str | None)
     request_id = str(action_input.get("requestId", ""))
     if action in {"create_extra_request", "create_and_submit_extra_request"}:
         created = api_json(
-            "/v1/oa/applications/asset_request",
+            f"/v1/oa/applications/{ASSET_REQUEST_BUSINESS_TYPE}",
             method="POST",
             payload={
                 "data": common_request_data(action_input),

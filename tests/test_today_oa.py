@@ -190,6 +190,15 @@ class TodayOASkillClientTest(unittest.TestCase):
         self.assertFalse(any("integrations/today/company-asset" in request.full_url for request in requests))
         self.assertEqual(requests[0].headers["Idempotency-key"], "skill:confirmation-1:create")
         self.assertEqual(requests[1].headers["Idempotency-key"], "skill:confirmation-1:submit")
+        created_body = json.loads(requests[0].data.decode())
+        self.assertEqual(created_body, {
+            "data": {
+                "purpose": "Development workstation",
+                "items": [{"catalogItemId": "33333333-3333-4333-8333-333333333333", "quantity": 1}],
+            },
+            "summary": "Development workstation",
+        })
+        self.assertNotIn("formKey", created_body)
 
     def test_common_resubmit_merges_current_snapshot(self):
         requests = []

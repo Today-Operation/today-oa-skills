@@ -16,6 +16,12 @@ the public `/v1/oa` API. `list_my_requests` also returns old device requests in
 the separate `legacyItems` read-only field, and `get_request` falls back to the
 old read-only record when the public application is not found.
 
+The frozen public contract uses business type and form key `asset_request`,
+process key `asset_request_manager_approval`, and approval step
+`manager_approval`. New submissions contain only `purpose`, optional
+`expectedDate`, and `items[{catalogItemId, quantity: 1}]`. The client omits
+`formKey` so the API resolves the latest active `asset_request` form version.
+
 ## Request writes
 
 - Create and submit: `{"action":"create_and_submit_extra_request","purpose":"开发使用","expectedDate":"2026-08-20","items":[{"catalogItemId":"<uuid>","quantity":1}],"confirmed":false}`
