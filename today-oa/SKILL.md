@@ -59,6 +59,8 @@ Never interpret a general request as confirmation. Never reuse a confirmation to
 - Prefer `create_and_submit_extra_request` when the user asks to apply for equipment.
 - Use `create_extra_request` only when the user explicitly requests a draft.
 - Query current request data before revising, resubmitting, withdrawing, or approving so the latest version is used.
+- When a request is in `changes_requested`, use `resubmit_request`; preserve the returned history and show the manager's reason.
+- Treat `legacyItems` from `list_my_requests` as read-only history. Never try to update an old request through the common application API.
 - Do not expose resources the API does not return.
 - Summarize statuses in Chinese unless the user uses another language.
 - For `MANAGER_MAPPING_MISSING`, tell the user to contact HR or the asset administrator.

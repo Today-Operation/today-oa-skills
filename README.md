@@ -9,3 +9,7 @@ Install from Today by asking:
 > 请安装 Today OA Skill：https://github.com/Today-Operation/today-oa-skills/tree/main/today-oa
 
 The Skill uses verified Google Workspace identity and calls the Today OA API directly. It does not contain Slack, banking, OA service, or employee credentials.
+
+Device request writes follow the server-advertised single `legacy` or `common`
+mode. Common mode uses the public OA application and approval API while keeping
+legacy requests read-only; the client never dual-writes the two approval paths.
