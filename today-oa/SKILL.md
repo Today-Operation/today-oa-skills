@@ -14,6 +14,7 @@ Use this Skill as the employee's single entry point for Today internal workflows
 - Identity comes only from the user's verified `today.ai` Google Workspace login.
 - Never display, read, copy, or summarize files stored in the private state directory.
 - Never modify business data directly. All writes must use the OA API confirmation flow.
+- Read `references/release.json` when reporting the environment. If `channel` is `test`, explicitly call it the isolated test environment and never describe its data or mock integrations as production.
 
 ## Check updates
 

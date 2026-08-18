@@ -28,6 +28,13 @@ class FakeResponse:
 
 
 class TodayOASkillClientTest(unittest.TestCase):
+    def test_contract_test_branch_targets_the_isolated_oa_environment(self):
+        self.assertEqual(client.LOCAL_RELEASE["channel"], "test")
+        self.assertEqual(
+            client.API_URL,
+            "https://oa-platform-api-test-3byd72bk3q-as.a.run.app",
+        )
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         directory = Path(self.temporary.name)

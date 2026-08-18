@@ -21,12 +21,15 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-API_URL = os.environ.get("TODAY_OA_API_URL", "https://oa-platform-3nj9aw3w.an.gateway.dev").rstrip("/")
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 PUBLIC_OAUTH_CONFIG = json.loads(
     (SKILL_ROOT / "references" / "oauth-client.json").read_text(encoding="utf-8")
 )
 LOCAL_RELEASE = json.loads((SKILL_ROOT / "references" / "release.json").read_text(encoding="utf-8"))
+API_URL = os.environ.get(
+    "TODAY_OA_API_URL",
+    str(LOCAL_RELEASE.get("apiBaseUrl", "https://oa-platform-3nj9aw3w.an.gateway.dev")),
+).rstrip("/")
 GOOGLE_CLIENT_ID = os.environ.get("TODAY_OA_GOOGLE_CLIENT_ID", str(PUBLIC_OAUTH_CONFIG["client_id"]))
 
 
