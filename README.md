@@ -2,7 +2,7 @@
 
 Official distributable Skills for Today internal workflows.
 
-Employees install the single `today-oa` Skill once. Device management is available first; contract, finance, procurement, and other OA modules will be added to the same Skill over time.
+Employees install the single `today-oa` Skill once. Device management and contract approval share the same verified identity and confirmation flow; finance, procurement, and other OA modules will be added to the same Skill over time.
 
 Install from Today by asking:
 

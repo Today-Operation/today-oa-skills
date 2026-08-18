@@ -144,6 +144,82 @@ class TodayOASkillClientTest(unittest.TestCase):
         self.assertEqual(captured["idempotency"], "skill:confirmation-1")
         self.assertNotIn("confirmationToken", captured["body"])
 
+    def test_contract_write_preview_is_local_and_binds_exact_payload(self):
+        action = {
+            "action": "contract_submit",
+            "applicationId": "application-1",
+            "confirmed": False,
+        }
+        with patch.object(client.urllib.request, "urlopen") as urlopen, patch.object(
+            client.secrets, "token_hex", return_value="contract-confirmation-1"
+        ):
+            result = client.execute(action)
+
+        urlopen.assert_not_called()
+        self.assertEqual(result["status"], "confirmation_required")
+        self.assertEqual(result["summary"]["operation"], "提交合同审批")
+        client.validate_confirmation("contract-confirmation-1", action)
+
+    def test_confirmed_contract_create_uses_direct_contract_api_and_verified_identity(self):
+        captured = {}
+        action = {
+            "action": "contract_create_draft",
+            "summary": "软件合同",
+            "data": {"version": 1, "contract_type": "software_purchase"},
+            "confirmed": True,
+        }
+        client.record_confirmation("contract-confirmation-1", action)
+
+        def open_request(request, timeout):
+            captured["url"] = request.full_url
+            captured["method"] = request.method
+            captured["headers"] = request.headers
+            captured["body"] = json.loads(request.data.decode())
+            self.assertEqual(timeout, 20)
+            return FakeResponse({"id": "application-1", "status": "draft"})
+
+        with patch.object(client, "active_id_token", return_value="google-id-token"), patch.object(
+            client.urllib.request, "urlopen", side_effect=open_request
+        ):
+            result = client.execute({**action, "confirmationToken": "contract-confirmation-1"})
+
+        self.assertEqual(result["status"], "draft")
+        self.assertTrue(captured["url"].endswith("/v1/contracts/drafts"))
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer google-id-token")
+        self.assertEqual(captured["headers"]["Idempotency-key"], "skill:contract-confirmation-1")
+        self.assertEqual(captured["body"], {
+            "summary": "软件合同",
+            "data": {"version": 1, "contract_type": "software_purchase"},
+        })
+
+    def test_contract_query_uses_pagination_and_no_idempotency_key(self):
+        captured = {}
+
+        def open_request(request, timeout):
+            captured["url"] = request.full_url
+            captured["method"] = request.method
+            captured["headers"] = request.headers
+            self.assertEqual(timeout, 20)
+            return FakeResponse({"items": [], "pagination": {"limit": 10, "offset": 20}})
+
+        with patch.object(client, "active_id_token", return_value="google-id-token"), patch.object(
+            client.urllib.request, "urlopen", side_effect=open_request
+        ):
+            result = client.execute({"action": "contract_list_my_applications", "limit": 10, "offset": 20})
+
+        self.assertEqual(result["items"], [])
+        self.assertIn("/v1/contracts/applications?limit=10&offset=20", captured["url"])
+        self.assertEqual(captured["method"], "GET")
+        self.assertNotIn("Idempotency-key", captured["headers"])
+
+    def test_contract_draft_rejects_conversation_identity_fields(self):
+        with self.assertRaises(client.ClientError) as error:
+            client.contract_draft_body({
+                "data": {"version": 1, "handler_employee_id": "user-supplied"},
+            })
+        self.assertEqual(error.exception.code, "IDENTITY_FIELD_FORBIDDEN")
+
     def test_update_status_does_not_block_when_manifest_is_unavailable(self):
         with patch.object(
             client,

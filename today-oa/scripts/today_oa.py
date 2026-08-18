@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Public Today OA device client using per-user Google Workspace identity."""
+"""Public Today OA client using per-user Google Workspace identity."""
 
 from __future__ import annotations
 
@@ -59,6 +59,32 @@ WRITE_ACTIONS = {
     "approve_request",
     "reject_request",
     "request_changes",
+    "contract_create_draft",
+    "contract_update_draft",
+    "contract_add_attachment",
+    "contract_submit",
+    "contract_withdraw",
+    "contract_approve",
+    "contract_reject",
+    "contract_delegate",
+}
+
+CONTRACT_ACTIONS = {
+    "contract_list_legal_entities",
+    "contract_list_my_applications",
+    "contract_get_application",
+    "contract_get_history",
+    "contract_list_pending_approvals",
+    *WRITE_ACTIONS.intersection({
+        "contract_create_draft",
+        "contract_update_draft",
+        "contract_add_attachment",
+        "contract_submit",
+        "contract_withdraw",
+        "contract_approve",
+        "contract_reject",
+        "contract_delegate",
+    }),
 }
 
 
@@ -431,6 +457,21 @@ def execute(action_input: dict[str, Any]) -> dict[str, Any]:
     if is_write and confirmed:
         validate_confirmation(confirmation_token, action_input)
 
+    if action in CONTRACT_ACTIONS:
+        if is_write and not confirmed:
+            result = {
+                "status": "confirmation_required",
+                "summary": contract_confirmation_summary(action, action_input),
+            }
+        else:
+            result = execute_contract_action(action, action_input, confirmation_token)
+        if is_write and not confirmed:
+            result["confirmationToken"] = secrets.token_hex(16)
+            record_confirmation(result["confirmationToken"], action_input)
+        if is_write and confirmed:
+            consume_confirmation(confirmation_token)
+        return result
+
     body = json.dumps({**action_input, "confirmed": confirmed}, ensure_ascii=False).encode()
     headers = {
         "authorization": f"Bearer {active_id_token()}",
@@ -465,6 +506,168 @@ def execute(action_input: dict[str, Any]) -> dict[str, Any]:
     if is_write and confirmed:
         consume_confirmation(confirmation_token)
     return result
+
+
+def required_string(action_input: dict[str, Any], field: str) -> str:
+    value = action_input.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ClientError("INVALID_INPUT", f"{field} is required")
+    return value.strip()
+
+
+def positive_page_value(action_input: dict[str, Any], field: str, default: int, maximum: int) -> int:
+    value = action_input.get(field, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > maximum:
+        raise ClientError("INVALID_INPUT", f"{field} must be an integer between 0 and {maximum}")
+    return value
+
+
+def contract_confirmation_summary(action: str, action_input: dict[str, Any]) -> dict[str, Any]:
+    summaries = {
+        "contract_create_draft": "新建合同草稿",
+        "contract_update_draft": "更新合同草稿",
+        "contract_add_attachment": "登记合同附件新版本",
+        "contract_submit": "提交合同审批",
+        "contract_withdraw": "撤回并取消合同申请",
+        "contract_approve": "通过合同审批",
+        "contract_reject": "驳回并终止合同审批",
+        "contract_delegate": "将合同审批转签给他人",
+    }
+    summary: dict[str, Any] = {"operation": summaries[action]}
+    for field in ("applicationId", "taskId", "reason"):
+        if field in action_input:
+            summary[field] = action_input[field]
+    if action == "contract_create_draft" or action == "contract_update_draft":
+        data = action_input.get("data")
+        if isinstance(data, dict):
+            summary.update({
+                "title": data.get("title"),
+                "contractType": data.get("contract_type"),
+                "counterparty": data.get("counterparty"),
+                "contractValue": data.get("contract_value"),
+            })
+    if action == "contract_add_attachment":
+        attachment = action_input.get("attachment")
+        if isinstance(attachment, dict):
+            summary["attachment"] = {
+                "fileName": attachment.get("fileName"),
+                "category": attachment.get("category"),
+                "storageProvider": attachment.get("storageProvider"),
+            }
+    if action == "contract_delegate":
+        summary["targetEmployeeId"] = action_input.get("targetEmployeeId")
+    return summary
+
+
+def execute_contract_action(action: str, action_input: dict[str, Any], confirmation_token: str | None) -> dict[str, Any]:
+    application_id = urllib.parse.quote(str(action_input.get("applicationId", "")), safe="")
+    task_id = urllib.parse.quote(str(action_input.get("taskId", "")), safe="")
+    method = "GET"
+    path = ""
+    body: dict[str, Any] | None = None
+
+    if action == "contract_list_legal_entities":
+        path = "/v1/contracts/legal-entities"
+    elif action == "contract_list_my_applications":
+        limit = positive_page_value(action_input, "limit", 20, 100)
+        offset = positive_page_value(action_input, "offset", 0, 1_000_000)
+        path = f"/v1/contracts/applications?{urllib.parse.urlencode({'limit': limit, 'offset': offset})}"
+    elif action == "contract_list_pending_approvals":
+        limit = positive_page_value(action_input, "limit", 20, 100)
+        offset = positive_page_value(action_input, "offset", 0, 1_000_000)
+        path = f"/v1/contracts/approvals/pending?{urllib.parse.urlencode({'limit': limit, 'offset': offset})}"
+    elif action == "contract_get_application":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        path = f"/v1/contracts/applications/{application_id}"
+    elif action == "contract_get_history":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        path = f"/v1/contracts/applications/{application_id}/history"
+    elif action == "contract_create_draft":
+        method, path = "POST", "/v1/contracts/drafts"
+        body = contract_draft_body(action_input)
+    elif action == "contract_update_draft":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        method, path = "PUT", f"/v1/contracts/applications/{application_id}/draft"
+        body = contract_draft_body(action_input)
+    elif action == "contract_add_attachment":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        attachment = action_input.get("attachment")
+        if not isinstance(attachment, dict):
+            raise ClientError("INVALID_INPUT", "attachment is required")
+        method, path, body = "POST", f"/v1/contracts/applications/{application_id}/attachments", attachment
+    elif action == "contract_submit":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        method, path, body = "POST", f"/v1/contracts/applications/{application_id}/submit", {}
+    elif action == "contract_withdraw":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        method, path = "POST", f"/v1/contracts/applications/{application_id}/withdraw"
+        body = {"reason": action_input["reason"]} if action_input.get("reason") else {}
+    elif action in {"contract_approve", "contract_reject"}:
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        task_id = urllib.parse.quote(required_string(action_input, "taskId"), safe="")
+        decision = "approve" if action == "contract_approve" else "reject"
+        body = {"action": decision}
+        if action_input.get("reason"):
+            body["reason"] = action_input["reason"]
+        if decision == "reject" and not action_input.get("reason"):
+            raise ClientError("INVALID_INPUT", "reason is required for contract rejection")
+        method, path = "POST", f"/v1/contracts/applications/{application_id}/approvals/{task_id}/actions"
+    elif action == "contract_delegate":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        task_id = urllib.parse.quote(required_string(action_input, "taskId"), safe="")
+        method, path = "POST", f"/v1/contracts/applications/{application_id}/approvals/{task_id}/assignment"
+        body = {
+            "action": "delegate",
+            "targetEmployeeId": required_string(action_input, "targetEmployeeId"),
+            "reason": required_string(action_input, "reason"),
+        }
+    else:
+        raise ClientError("INVALID_ACTION", "Unsupported contract action")
+
+    headers = {
+        "authorization": f"Bearer {active_id_token()}",
+        "accept": "application/json",
+        "x-oa-source": "skill",
+    }
+    encoded = None
+    if body is not None:
+        headers["content-type"] = "application/json"
+        encoded = json.dumps(body, ensure_ascii=False).encode()
+    if confirmation_token:
+        headers["idempotency-key"] = f"skill:{confirmation_token}"
+    request = urllib.request.Request(f"{API_URL}{path}", data=encoded, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        try:
+            payload = json.loads(error.read().decode())
+            detail = payload.get("error", payload) if isinstance(payload, dict) else {}
+            if isinstance(detail, dict):
+                raise ClientError(str(detail.get("code", "HTTP_ERROR")), str(detail.get("message", "OA request failed")))
+            raise ClientError("HTTP_ERROR", str(detail))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise ClientError("HTTP_ERROR", "OA request failed") from None
+    except urllib.error.URLError as error:
+        raise ClientError("NETWORK_ERROR", f"Unable to reach OA: {error.reason}") from None
+    if not isinstance(result, dict):
+        raise ClientError("INVALID_RESPONSE", "OA returned an invalid response")
+    return result
+
+
+def contract_draft_body(action_input: dict[str, Any]) -> dict[str, Any]:
+    data = action_input.get("data")
+    if not isinstance(data, dict):
+        raise ClientError("INVALID_INPUT", "data is required")
+    forbidden = {"handler_employee_id", "business_owner_employee_id"}.intersection(data)
+    if forbidden:
+        raise ClientError("IDENTITY_FIELD_FORBIDDEN", "Employee identity fields are filled by OA from the verified login")
+    body: dict[str, Any] = {"data": data}
+    if "summary" in action_input:
+        body["summary"] = action_input["summary"]
+    if "deepLink" in action_input:
+        body["deepLink"] = action_input["deepLink"]
+    return body
 
 
 def parse_arguments() -> argparse.Namespace:
