@@ -1,5 +1,8 @@
 import importlib.util
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,11 +31,30 @@ class FakeResponse:
 
 
 class TodayOASkillClientTest(unittest.TestCase):
-    def test_contract_test_branch_targets_the_isolated_oa_environment(self):
-        self.assertEqual(client.LOCAL_RELEASE["channel"], "test")
+    def test_test_environment_uses_explicit_environment_overrides(self):
+        state_dir = str(Path(self.temporary.name) / "isolated-state") if hasattr(self, "temporary") else "/tmp/today-oa-test-state"
+        environment = {
+            **os.environ,
+            "TODAY_OA_API_URL": "https://oa-test.example.invalid/",
+            "TODAY_OA_GOOGLE_CLIENT_ID": "test-client-id",
+            "TODAY_OA_STATE_DIR": state_dir,
+        }
+        program = (
+            "import importlib.util, json; "
+            f"s=importlib.util.spec_from_file_location('override_client',{str(SCRIPT)!r}); "
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+            "print(json.dumps([m.API_URL,m.GOOGLE_CLIENT_ID,str(m.STATE_DIR)]))"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", program],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         self.assertEqual(
-            client.API_URL,
-            "https://oa-platform-api-test-3byd72bk3q-as.a.run.app",
+            json.loads(completed.stdout),
+            ["https://oa-test.example.invalid", "test-client-id", state_dir],
         )
 
     def setUp(self):
@@ -142,7 +164,9 @@ class TodayOASkillClientTest(unittest.TestCase):
             self.assertEqual(timeout, 20)
             return FakeResponse({"status": "submitted"})
 
-        with patch.object(client, "active_id_token", return_value="id-token"), patch.object(
+        with patch.object(client, "device_request_mode", return_value="legacy"), patch.object(
+            client, "active_id_token", return_value="id-token"
+        ), patch.object(
             client.urllib.request, "urlopen", side_effect=open_request
         ):
             result = client.execute({**action, "confirmationToken": "confirmation-1"})
@@ -226,6 +250,154 @@ class TodayOASkillClientTest(unittest.TestCase):
                 "data": {"version": 1, "handler_employee_id": "user-supplied"},
             })
         self.assertEqual(error.exception.code, "IDENTITY_FIELD_FORBIDDEN")
+
+    def test_common_preview_performs_no_remote_write(self):
+        action = {
+            "action": "create_and_submit_extra_request",
+            "purpose": "Development workstation",
+            "items": [{"catalogItemId": "33333333-3333-4333-8333-333333333333", "quantity": 1}],
+            "confirmed": False,
+        }
+        with patch.object(client, "device_request_mode", return_value="common"), patch.object(
+            client.urllib.request, "urlopen"
+        ) as open_request, patch.object(client.secrets, "token_hex", return_value="confirmation-1"):
+            result = client.execute(action)
+
+        self.assertEqual(result["requestWriteMode"], "common")
+        self.assertEqual(result["confirmationToken"], "confirmation-1")
+        open_request.assert_not_called()
+
+    def test_common_create_and_submit_only_calls_public_oa(self):
+        requests = []
+        action = {
+            "action": "create_and_submit_extra_request",
+            "purpose": "Development workstation",
+            "items": [{"catalogItemId": "33333333-3333-4333-8333-333333333333", "quantity": 1}],
+            "confirmed": True,
+        }
+        client.record_confirmation("confirmation-1", action)
+
+        def open_request(request, timeout):
+            requests.append(request)
+            self.assertEqual(timeout, 20)
+            if request.full_url.endswith("/v1/oa/applications/asset_request"):
+                return FakeResponse({"id": "44444444-4444-4444-8444-444444444444", "status": "draft"})
+            return FakeResponse({"id": "44444444-4444-4444-8444-444444444444", "status": "in_review"})
+
+        with patch.object(client, "device_request_mode", return_value="common"), patch.object(
+            client, "active_id_token", return_value="id-token"
+        ), patch.object(client.urllib.request, "urlopen", side_effect=open_request):
+            result = client.execute({**action, "confirmationToken": "confirmation-1"})
+
+        self.assertEqual(result["status"], "in_review")
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(all("/v1/oa/" in request.full_url for request in requests))
+        self.assertFalse(any("integrations/today/company-asset" in request.full_url for request in requests))
+        self.assertEqual(requests[0].headers["Idempotency-key"], "skill:confirmation-1:create")
+        self.assertEqual(requests[1].headers["Idempotency-key"], "skill:confirmation-1:submit")
+        created_body = json.loads(requests[0].data.decode())
+        self.assertEqual(created_body, {
+            "data": {
+                "purpose": "Development workstation",
+                "items": [{"catalogItemId": "33333333-3333-4333-8333-333333333333", "quantity": 1}],
+            },
+            "summary": "Development workstation",
+        })
+        self.assertNotIn("formKey", created_body)
+
+    def test_common_resubmit_merges_current_snapshot(self):
+        requests = []
+        action = {
+            "action": "resubmit_request",
+            "requestId": "44444444-4444-4444-8444-444444444444",
+            "purpose": "Updated purpose",
+            "confirmed": True,
+        }
+        client.record_confirmation("confirmation-1", action)
+
+        def open_request(request, timeout):
+            requests.append(request)
+            self.assertEqual(timeout, 20)
+            if request.method == "GET":
+                return FakeResponse({
+                    "id": action["requestId"],
+                    "status": "changes_requested",
+                    "data": {"purpose": "Old", "items": [{"catalogItemId": "catalog-1", "quantity": 1}]},
+                })
+            return FakeResponse({"id": action["requestId"], "status": "in_review", "currentRevision": 2})
+
+        with patch.object(client, "device_request_mode", return_value="common"), patch.object(
+            client, "active_id_token", return_value="id-token"
+        ), patch.object(client.urllib.request, "urlopen", side_effect=open_request):
+            client.execute({**action, "confirmationToken": "confirmation-1"})
+
+        submitted = json.loads(requests[1].data.decode())
+        self.assertEqual(submitted["data"]["purpose"], "Updated purpose")
+        self.assertEqual(submitted["data"]["items"][0]["catalogItemId"], "catalog-1")
+        self.assertTrue(requests[1].full_url.endswith("/resubmit"))
+
+    def test_request_mode_is_discovered_from_public_metadata(self):
+        with patch.object(
+            client.urllib.request,
+            "urlopen",
+            return_value=FakeResponse({"requestWriteMode": "common"}),
+        ), patch.dict(client.os.environ, {"TODAY_OA_DEVICE_REQUEST_MODE": "auto"}):
+            self.assertEqual(client.device_request_mode(), "common")
+
+    def test_dual_device_request_mode_is_rejected_without_network_access(self):
+        with patch.dict(client.os.environ, {"TODAY_OA_DEVICE_REQUEST_MODE": "dual"}), patch.object(
+            client.urllib.request, "urlopen"
+        ) as urlopen, self.assertRaises(client.ClientError) as error:
+            client.device_request_mode()
+
+        self.assertEqual(error.exception.code, "INVALID_CONFIGURATION")
+        urlopen.assert_not_called()
+
+    def test_common_approval_action_only_calls_public_oa(self):
+        requests = []
+        action = {
+            "action": "approve_request",
+            "taskId": "55555555-5555-4555-8555-555555555555",
+            "confirmed": True,
+        }
+        client.record_confirmation("confirmation-1", action)
+
+        def open_request(request, timeout):
+            requests.append(request)
+            self.assertEqual(timeout, 20)
+            return FakeResponse({"status": "approved"})
+
+        with patch.object(client, "device_request_mode", return_value="common"), patch.object(
+            client, "active_id_token", return_value="id-token"
+        ), patch.object(client.urllib.request, "urlopen", side_effect=open_request):
+            result = client.execute({**action, "confirmationToken": "confirmation-1"})
+
+        self.assertEqual(result["status"], "approved")
+        self.assertEqual(len(requests), 1)
+        self.assertIn("/v1/oa/approvals/", requests[0].full_url)
+        self.assertNotIn("company-asset", requests[0].full_url)
+
+    def test_asset_return_remains_on_device_domain(self):
+        requests = []
+        action = {"action": "request_return", "assetId": "asset-1", "confirmed": True}
+        client.record_confirmation("confirmation-1", action)
+
+        def open_request(request, timeout):
+            requests.append(request)
+            self.assertEqual(timeout, 20)
+            return FakeResponse({"status": "return_requested"})
+
+        with patch.dict(client.os.environ, {"TODAY_OA_DEVICE_REQUEST_MODE": "common"}), patch.object(
+            client, "device_request_mode"
+        ) as request_mode, patch.object(client, "active_id_token", return_value="id-token"), patch.object(
+            client.urllib.request, "urlopen", side_effect=open_request
+        ):
+            result = client.execute({**action, "confirmationToken": "confirmation-1"})
+
+        self.assertEqual(result["status"], "return_requested")
+        request_mode.assert_not_called()
+        self.assertEqual(len(requests), 1)
+        self.assertIn("/v1/company-assets/integrations/today/company-asset", requests[0].full_url)
 
     def test_update_status_does_not_block_when_manifest_is_unavailable(self):
         with patch.object(

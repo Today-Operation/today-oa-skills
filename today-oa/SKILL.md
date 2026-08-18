@@ -66,6 +66,8 @@ Never interpret a general request as confirmation. Never reuse a confirmation to
 - AI contract review is advisory and does not block submission.
 - Rejection terminates a contract approval. Do not offer “驳回重改” or resubmission for a rejected contract.
 - The current contract attachment action records versioned storage metadata. Do not claim a file was uploaded to Google Drive unless the returned storage provider and integration status prove it.
+- When a request is in `changes_requested`, use `resubmit_request`; preserve the returned history and show the manager's reason.
+- Treat `legacyItems` from `list_my_requests` as read-only history. Never try to update an old request through the common application API.
 - Do not expose resources the API does not return.
 - Summarize statuses in Chinese unless the user uses another language.
 - For `MANAGER_MAPPING_MISSING`, tell the user to contact HR or the asset administrator.
