@@ -12,7 +12,9 @@ The compatibility test branch keeps the production defaults unchanged. Test runs
 
 > 请安装合同与设备兼容测试版 Today OA Skill：https://github.com/Today-Operation/today-oa-skills/tree/agent/contracts-device-compat-20260818/today-oa
 
-The unified test candidate adds expense reimbursement without changing the stable channel. It must use the isolated test API, OAuth client, and state directory; users should not install it until the test release is published and the acceptance checklist says it is ready.
+The unified test candidate adds expense reimbursement without changing the stable channel. It must use the isolated test API, OAuth client, and state directory; users should not install it until the acceptance checklist says it is ready:
+
+> 请安装设备、合同与报销统一测试版 Today OA Skill：https://github.com/Today-Operation/today-oa-skills/tree/agent/device-contract-expense-test-20260819/today-oa
 
 The Skill uses verified Google Workspace identity and calls the Today OA API directly. It does not contain Slack, banking, OA service, or employee credentials.
 
