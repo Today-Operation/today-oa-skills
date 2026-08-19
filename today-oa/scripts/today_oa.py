@@ -33,17 +33,13 @@ API_URL = os.environ.get(
 GOOGLE_CLIENT_ID = os.environ.get("TODAY_OA_GOOGLE_CLIENT_ID", str(PUBLIC_OAUTH_CONFIG["client_id"]))
 
 
-def default_state_dir(skill_root: Path = SKILL_ROOT) -> Path:
-    community_root = Path("/home/user/.today/skills/community")
-    try:
-        skill_root.relative_to(community_root)
-        return community_root / ".state" / "today-oa"
-    except ValueError:
-        return Path.home() / ".today-oa"
+def default_state_dir() -> Path:
+    return Path.home() / ".today-oa"
 
 
 STATE_DIR = Path(os.environ.get("TODAY_OA_STATE_DIR", str(default_state_dir())))
 TOKEN_FILE = STATE_DIR / "auth.json"
+STORAGE_AUTH_URI = "storage://agent/today-oa/auth.json"
 DEVICE_FILE = STATE_DIR / "device.json"
 CONFIRMATION_FILE = STATE_DIR / "confirmations.json"
 UPDATE_CACHE_FILE = STATE_DIR / "update-check.json"
@@ -216,6 +212,21 @@ def read_json(path: Path) -> dict[str, Any]:
         return payload
     except (FileNotFoundError, json.JSONDecodeError, ValueError):
         raise ClientError("LOGIN_REQUIRED", "Google Workspace login is required") from None
+
+
+def sandbox_auth_uri(token_file: Path | None = None) -> str:
+    path = TOKEN_FILE if token_file is None else token_file
+    try:
+        return "sandbox://" + path.relative_to(Path.home()).as_posix()
+    except ValueError:
+        return "sandbox://.today-oa/auth.json"
+
+
+def auth_paths() -> dict[str, str]:
+    return {
+        "sandboxUri": sandbox_auth_uri(),
+        "storageUri": STORAGE_AUTH_URI,
+    }
 
 
 def require_oauth_config() -> None:
@@ -679,6 +690,7 @@ def parse_arguments() -> argparse.Namespace:
     subparsers.add_parser("auth-start")
     subparsers.add_parser("auth-finish")
     subparsers.add_parser("auth-status")
+    subparsers.add_parser("auth-paths")
     subparsers.add_parser("logout")
     update_status_parser = subparsers.add_parser("update-status")
     update_status_parser.add_argument("--force", action="store_true")
@@ -709,6 +721,8 @@ def main() -> int:
                     result = {"status": "login_required"}
                 else:
                     raise
+        elif args.command == "auth-paths":
+            result = auth_paths()
         elif args.command == "logout":
             TOKEN_FILE.unlink(missing_ok=True)
             DEVICE_FILE.unlink(missing_ok=True)

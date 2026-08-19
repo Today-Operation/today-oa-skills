@@ -267,11 +267,25 @@ class TodayOASkillClientTest(unittest.TestCase):
 
         process.assert_called_once()
 
-    def test_today_install_keeps_state_outside_replaceable_skill_directory(self):
-        state = client.default_state_dir(
-            Path("/home/user/.today/skills/community/today-oa")
-        )
-        self.assertEqual(state, Path("/home/user/.today/skills/community/.state/today-oa"))
+    def test_local_state_stays_in_home_not_in_the_skill_tree(self):
+        self.assertEqual(client.default_state_dir(), Path.home() / ".today-oa")
+
+    def test_auth_paths_maps_home_token_file_to_todaycopy_uris(self):
+        token_file = Path.home() / ".today-oa" / "auth.json"
+        with patch.object(client, "TOKEN_FILE", token_file):
+            result = client.auth_paths()
+
+        self.assertEqual(result, {
+            "sandboxUri": "sandbox://.today-oa/auth.json",
+            "storageUri": "storage://agent/today-oa/auth.json",
+        })
+
+    def test_auth_paths_uses_stable_sandbox_uri_when_token_file_is_outside_home(self):
+        with patch.object(client, "TOKEN_FILE", Path("/tmp/today-oa-auth.json")):
+            result = client.auth_paths()
+
+        self.assertEqual(result["sandboxUri"], "sandbox://.today-oa/auth.json")
+        self.assertEqual(result["storageUri"], "storage://agent/today-oa/auth.json")
 
 
 if __name__ == "__main__":

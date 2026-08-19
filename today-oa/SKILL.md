@@ -12,7 +12,8 @@ Use this Skill as the employee's single entry point for Today internal workflows
 - Use `scripts/today_oa.py` for every OA operation.
 - Never ask for or pass an employee ID, email, tenant ID, role, Google token, or shared service secret.
 - Identity comes only from the user's verified `today.ai` Google Workspace login.
-- Never display, read, copy, or summarize files stored in the private state directory.
+- Never `TodayRead`, `cat`, print, or summarize the credential file. The only allowed transfer is `TodayCopy` between the exact `sandboxUri` and `storageUri` returned by `auth-paths`.
+- Never store credentials inside this Skill directory. Durable login state lives in `storage://agent`, not in a shareable Skill tree.
 - Never modify business data directly. All writes must use the OA API confirmation flow.
 - Read `references/release.json` when reporting the environment. If `channel` is `test`, explicitly call it the isolated test environment and never describe its data or mock integrations as production.
 
@@ -28,11 +29,16 @@ Run `python3 scripts/today_oa.py update-status` once at the start of an OA reque
 
 ## Authenticate
 
-1. Run `python3 scripts/today_oa.py auth-status`.
-2. If login is required, run `python3 scripts/today_oa.py auth-start`.
-3. Show the returned `verification_url` and `user_code` to the user.
-4. After the user confirms authorization, run `python3 scripts/today_oa.py auth-finish`.
-5. Never display or read the local credential file.
+Local credential files disappear when the sandbox is replaced. Persist them with `TodayCopy` to the user's private `storage://agent` file, not inside this Skill directory.
+
+1. Run `python3 scripts/today_oa.py auth-paths` and use the returned URIs exactly. Do not invent a different path.
+2. Restore first: `TodayCopy({ "source": "<storageUri>", "destination": "<sandboxUri>" })`. If the storage file does not exist, continue as logged out. Do not retry other paths.
+3. Run `python3 scripts/today_oa.py auth-status`.
+4. If login is required, run `python3 scripts/today_oa.py auth-start`.
+5. Show the returned `verification_url` and `user_code` to the user.
+6. After the user confirms authorization, run `python3 scripts/today_oa.py auth-finish`.
+7. After `auth-status` or `auth-finish` returns `authenticated`, save: `TodayCopy({ "source": "<sandboxUri>", "destination": "<storageUri>" })`.
+8. Never `TodayRead` the credential file or include its contents in the conversation.
 
 ## Route the request
 
@@ -71,8 +77,11 @@ Never interpret a general request as confirmation. Never reuse a confirmation to
 - For `MANAGER_MAPPING_MISSING`, tell the user to contact HR or the asset administrator.
 - For `VERSION_CONFLICT` or `REVISION_CONFLICT`, fetch the latest request before trying again.
 - For `ALREADY_HANDLED`, show the latest status and do not repeat the action.
-- For `UNAUTHORIZED` or `LOGIN_REQUIRED`, restart Google authentication.
+- For `UNAUTHORIZED` or `LOGIN_REQUIRED`, restart the Authenticate section, including the `TodayCopy` restore and save steps.
 
 ## Logout
 
-Run `python3 scripts/today_oa.py logout` only when the user explicitly asks to disconnect the OA account.
+Run these two steps only when the user explicitly asks to disconnect the OA account:
+
+1. `python3 scripts/today_oa.py logout`
+2. `TodayRemove({ "path": "<storageUri>" })` using the `storageUri` from `auth-paths`
