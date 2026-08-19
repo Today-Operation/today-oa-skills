@@ -71,6 +71,16 @@ WRITE_ACTIONS = {
     "contract_approve",
     "contract_reject",
     "contract_delegate",
+    "expense_create_draft",
+    "expense_update_draft",
+    "expense_add_attachment",
+    "expense_replace_attachment",
+    "expense_submit",
+    "expense_withdraw",
+    "expense_cancel",
+    "expense_approve",
+    "expense_request_changes",
+    "expense_reject",
 }
 
 CONTRACT_ACTIONS = {
@@ -88,6 +98,24 @@ CONTRACT_ACTIONS = {
         "contract_approve",
         "contract_reject",
         "contract_delegate",
+    }),
+}
+EXPENSE_ACTIONS = {
+    "expense_list_my_claims",
+    "expense_get_claim",
+    "expense_get_history",
+    "expense_list_pending_approvals",
+    *WRITE_ACTIONS.intersection({
+        "expense_create_draft",
+        "expense_update_draft",
+        "expense_add_attachment",
+        "expense_replace_attachment",
+        "expense_submit",
+        "expense_withdraw",
+        "expense_cancel",
+        "expense_approve",
+        "expense_request_changes",
+        "expense_reject",
     }),
 }
 COMMON_APPLICATION_ACTIONS = {
@@ -698,6 +726,20 @@ def execute(action_input: dict[str, Any]) -> dict[str, Any]:
         if is_write and confirmed:
             consume_confirmation(confirmation_token)
         return result
+    if action in EXPENSE_ACTIONS:
+        if is_write and not confirmed:
+            result = {
+                "status": "confirmation_required",
+                "summary": expense_confirmation_summary(action, action_input),
+            }
+        else:
+            result = execute_expense_action(action, action_input, confirmation_token)
+        if is_write and not confirmed:
+            result["confirmationToken"] = secrets.token_hex(16)
+            record_confirmation(result["confirmationToken"], action_input)
+        if is_write and confirmed:
+            consume_confirmation(confirmation_token)
+        return result
     mode = device_request_mode() if action in COMMON_APPLICATION_ACTIONS else "legacy"
     if mode == "common" and is_write and not confirmed:
         result = {
@@ -880,6 +922,118 @@ def contract_draft_body(action_input: dict[str, Any]) -> dict[str, Any]:
     if "deepLink" in action_input:
         body["deepLink"] = action_input["deepLink"]
     return body
+
+
+def expense_confirmation_summary(action: str, action_input: dict[str, Any]) -> dict[str, Any]:
+    summaries = {
+        "expense_create_draft": "新建报销草稿",
+        "expense_update_draft": "更新或重提交报销草稿",
+        "expense_add_attachment": "登记报销附件",
+        "expense_replace_attachment": "替换报销附件版本",
+        "expense_submit": "提交报销审批",
+        "expense_withdraw": "撤回报销申请",
+        "expense_cancel": "取消报销申请",
+        "expense_approve": "通过报销审批",
+        "expense_request_changes": "要求修改报销申请",
+        "expense_reject": "拒绝报销申请",
+    }
+    summary: dict[str, Any] = {"operation": summaries[action]}
+    for field in ("claimId", "attachmentId", "reason"):
+        if field in action_input:
+            summary[field] = action_input[field]
+    if action in {"expense_create_draft", "expense_update_draft"}:
+        data = action_input.get("data")
+        if isinstance(data, dict):
+            summary.update({
+                "purpose": data.get("purpose"),
+                "currency": data.get("reimbursementCurrency"),
+                "lineCount": len(data.get("lines", [])) if isinstance(data.get("lines"), list) else None,
+            })
+    if action in {"expense_add_attachment", "expense_replace_attachment"}:
+        attachment = action_input.get("attachment")
+        if isinstance(attachment, dict):
+            summary["attachment"] = {
+                "fileName": attachment.get("fileName"),
+                "sha256": attachment.get("sha256"),
+            }
+    return summary
+
+
+def expense_draft_body(action_input: dict[str, Any]) -> dict[str, Any]:
+    data = action_input.get("data")
+    if not isinstance(data, dict):
+        raise ClientError("INVALID_INPUT", "data is required")
+    forbidden = {
+        "applicantEmployeeId",
+        "applicant_employee_id",
+        "employeeId",
+        "employee_id",
+        "tenantId",
+        "tenant_id",
+        "roles",
+    }.intersection(data)
+    if forbidden:
+        raise ClientError("IDENTITY_FIELD_FORBIDDEN", "Employee identity and roles are filled by OA from the verified login")
+    return data
+
+
+def execute_expense_action(action: str, action_input: dict[str, Any], confirmation_token: str | None) -> dict[str, Any]:
+    method = "GET"
+    path = "/v1/expenses"
+    body: dict[str, Any] | None = None
+    claim_id = ""
+
+    if action == "expense_list_my_claims":
+        pass
+    elif action == "expense_list_pending_approvals":
+        path = "/v1/expenses/pending"
+    elif action in {"expense_get_claim", "expense_get_history"}:
+        claim_id = urllib.parse.quote(required_string(action_input, "claimId"), safe="")
+        path = f"/v1/expenses/{claim_id}"
+        if action == "expense_get_history":
+            path += "/history"
+    elif action == "expense_create_draft":
+        method, body = "POST", expense_draft_body(action_input)
+    elif action == "expense_update_draft":
+        claim_id = urllib.parse.quote(required_string(action_input, "claimId"), safe="")
+        method, path, body = "PUT", f"/v1/expenses/{claim_id}/draft", expense_draft_body(action_input)
+    elif action in {"expense_add_attachment", "expense_replace_attachment"}:
+        claim_id = urllib.parse.quote(required_string(action_input, "claimId"), safe="")
+        attachment = action_input.get("attachment")
+        if not isinstance(attachment, dict):
+            raise ClientError("INVALID_INPUT", "attachment is required")
+        method, body = "POST", attachment
+        path = f"/v1/expenses/{claim_id}/attachments"
+        if action == "expense_replace_attachment":
+            attachment_id = urllib.parse.quote(required_string(action_input, "attachmentId"), safe="")
+            path += f"/{attachment_id}/replace"
+    elif action in {"expense_submit", "expense_withdraw", "expense_cancel"}:
+        claim_id = urllib.parse.quote(required_string(action_input, "claimId"), safe="")
+        method, path = "POST", f"/v1/expenses/{claim_id}/{action.removeprefix('expense_')}"
+        if action == "expense_cancel":
+            body = {"reason": required_string(action_input, "reason")}
+        elif action_input.get("reason"):
+            body = {"reason": action_input["reason"]}
+        else:
+            body = {}
+    elif action in {"expense_approve", "expense_request_changes", "expense_reject"}:
+        claim_id = urllib.parse.quote(required_string(action_input, "claimId"), safe="")
+        decision = {
+            "expense_approve": "approve",
+            "expense_request_changes": "request_changes",
+            "expense_reject": "reject",
+        }[action]
+        body = {"action": decision}
+        if action_input.get("reason"):
+            body["reason"] = action_input["reason"]
+        if decision in {"request_changes", "reject"} and not action_input.get("reason"):
+            raise ClientError("INVALID_INPUT", "reason is required when requesting changes or rejecting an expense")
+        method, path = "POST", f"/v1/expenses/{claim_id}/approval"
+    else:
+        raise ClientError("INVALID_ACTION", "Unsupported expense action")
+
+    key = f"skill:{confirmation_token}" if confirmation_token else None
+    return api_json(path, method=method, payload=body, idempotency_key=key)
 
 
 def parse_arguments() -> argparse.Namespace:

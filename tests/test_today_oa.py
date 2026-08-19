@@ -445,6 +445,98 @@ class TodayOASkillClientTest(unittest.TestCase):
         )
         self.assertEqual(state, Path("/home/user/.today/skills/community/.state/today-oa"))
 
+    def test_expense_write_preview_is_local_and_binds_exact_payload(self):
+        action = {
+            "action": "expense_submit",
+            "claimId": "11111111-1111-4111-8111-111111111111",
+            "confirmed": False,
+        }
+        with patch.object(client.urllib.request, "urlopen") as urlopen, patch.object(
+            client.secrets, "token_hex", return_value="expense-confirmation-1"
+        ):
+            result = client.execute(action)
+
+        urlopen.assert_not_called()
+        self.assertEqual(result["status"], "confirmation_required")
+        self.assertEqual(result["summary"]["operation"], "提交报销审批")
+        client.validate_confirmation("expense-confirmation-1", action)
+
+    def test_confirmed_expense_create_uses_expense_api_and_verified_identity(self):
+        captured = {}
+        action = {
+            "action": "expense_create_draft",
+            "data": {
+                "legalEntityId": "22222222-2222-4222-8222-222222222222",
+                "reimbursementCurrency": "CNY",
+                "costCenterRef": "CC-RD",
+                "beneficiaryRef": "33333333-3333-4333-8333-333333333333",
+                "paymentAccountRef": "44444444-4444-4444-8444-444444444444",
+                "purpose": "测试交通费",
+                "lines": [],
+            },
+            "confirmed": True,
+        }
+        client.record_confirmation("expense-confirmation-1", action)
+
+        def open_request(request, timeout):
+            captured["url"] = request.full_url
+            captured["method"] = request.method
+            captured["headers"] = request.headers
+            captured["body"] = json.loads(request.data.decode())
+            self.assertEqual(timeout, 20)
+            return FakeResponse({"id": "claim-1", "status": "draft"})
+
+        with patch.object(client, "active_id_token", return_value="google-id-token"), patch.object(
+            client.urllib.request, "urlopen", side_effect=open_request
+        ):
+            result = client.execute({**action, "confirmationToken": "expense-confirmation-1"})
+
+        self.assertEqual(result["status"], "draft")
+        self.assertTrue(captured["url"].endswith("/v1/expenses"))
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer google-id-token")
+        self.assertEqual(captured["headers"]["Idempotency-key"], "skill:expense-confirmation-1")
+        self.assertEqual(captured["body"]["purpose"], "测试交通费")
+
+    def test_expense_query_uses_no_idempotency_key(self):
+        captured = {}
+
+        def open_request(request, timeout):
+            captured["url"] = request.full_url
+            captured["headers"] = request.headers
+            self.assertEqual(timeout, 20)
+            return FakeResponse({"items": []})
+
+        with patch.object(client, "active_id_token", return_value="google-id-token"), patch.object(
+            client.urllib.request, "urlopen", side_effect=open_request
+        ):
+            result = client.execute({"action": "expense_list_my_claims"})
+
+        self.assertEqual(result["items"], [])
+        self.assertTrue(captured["url"].endswith("/v1/expenses"))
+        self.assertNotIn("Idempotency-key", captured["headers"])
+
+    def test_expense_request_changes_requires_reason(self):
+        action = {
+            "action": "expense_request_changes",
+            "claimId": "11111111-1111-4111-8111-111111111111",
+            "confirmed": True,
+        }
+        client.record_confirmation("expense-confirmation-1", action)
+        with patch.object(client, "active_id_token", return_value="google-id-token"), self.assertRaises(
+            client.ClientError
+        ) as error:
+            client.execute({**action, "confirmationToken": "expense-confirmation-1"})
+
+        self.assertEqual(error.exception.code, "INVALID_INPUT")
+
+    def test_expense_draft_rejects_conversation_identity_fields(self):
+        with self.assertRaises(client.ClientError) as error:
+            client.expense_draft_body({
+                "data": {"purpose": "测试", "employeeId": "user-supplied"},
+            })
+        self.assertEqual(error.exception.code, "IDENTITY_FIELD_FORBIDDEN")
+
 
 if __name__ == "__main__":
     unittest.main()

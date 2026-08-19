@@ -1,11 +1,11 @@
 ---
 name: today-oa
-description: Use Today OA to access company workflows with verified Google Workspace identity. Use for device management and contract approval, including contract drafts, submission, withdrawal, history, approval, rejection, and delegation. This remains the single entry point for future finance, procurement, and other internal OA workflows.
+description: Use Today OA to access company workflows with verified Google Workspace identity. Use for device management, contract approval, and expense reimbursement, including drafts, submission, withdrawal, history, approval, rejection, and changes requested. This remains the single entry point for future finance, procurement, and other internal OA workflows.
 ---
 
 # Today OA
 
-Use this Skill as the employee's single entry point for Today internal workflows. Company device management and contract approval are available modules. Finance and other domains will be added without requiring a separate Skill installation.
+Use this Skill as the employee's single entry point for Today internal workflows. Company device management, contract approval, and expense reimbursement are available modules. Future domains will be added without requiring a separate Skill installation.
 
 ## Safety and identity
 
@@ -44,7 +44,9 @@ python3 scripts/today_oa.py execute --input-json '<JSON object>'
 
 For contract requests, read [references/contract-actions.md](references/contract-actions.md), then use the same command.
 
-Do not claim that finance, procurement, or other future modules are available until their matching reference file and API actions exist in this installed version.
+For expense reimbursement requests, read [references/expense-actions.md](references/expense-actions.md), then use the same command.
+
+Do not claim that procurement, payment execution, or other future modules are available until their matching reference file and API actions exist in this installed version.
 
 ## Confirm writes
 
@@ -63,6 +65,7 @@ Never interpret a general request as confirmation. Never reuse a confirmation to
 - Use `create_extra_request` only when the user explicitly requests a draft.
 - Query current request data before revising, resubmitting, withdrawing, or approving so the latest version is used.
 - For a contract application, first list legal entities and collect the universal required fields. Never invent a legal-entity ID, attachment metadata, FX snapshot, application ID, task ID, or employee ID.
+- For an expense claim, collect line items and obtain legal entity, beneficiary, and payment-account references only from authorized OA results. Never ask the user to place bank-account details, identity numbers, or invoice file contents in the conversation.
 - AI contract review is advisory and does not block submission.
 - Rejection terminates a contract approval. Do not offer “驳回重改” or resubmission for a rejected contract.
 - The current contract attachment action records versioned storage metadata. Do not claim a file was uploaded to Google Drive unless the returned storage provider and integration status prove it.
