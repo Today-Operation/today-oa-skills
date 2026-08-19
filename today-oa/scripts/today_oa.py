@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Public Today OA device client using per-user Google Workspace identity."""
+"""Public Today OA client using per-user Google Workspace identity."""
 
 from __future__ import annotations
 
@@ -21,12 +21,15 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-API_URL = os.environ.get("TODAY_OA_API_URL", "https://oa-platform-3nj9aw3w.an.gateway.dev").rstrip("/")
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 PUBLIC_OAUTH_CONFIG = json.loads(
     (SKILL_ROOT / "references" / "oauth-client.json").read_text(encoding="utf-8")
 )
 LOCAL_RELEASE = json.loads((SKILL_ROOT / "references" / "release.json").read_text(encoding="utf-8"))
+API_URL = os.environ.get(
+    "TODAY_OA_API_URL",
+    str(LOCAL_RELEASE.get("apiBaseUrl", "https://oa-platform-3nj9aw3w.an.gateway.dev")),
+).rstrip("/")
 GOOGLE_CLIENT_ID = os.environ.get("TODAY_OA_GOOGLE_CLIENT_ID", str(PUBLIC_OAUTH_CONFIG["client_id"]))
 
 
@@ -53,13 +56,56 @@ WRITE_ACTIONS = {
     "create_extra_request",
     "create_and_submit_extra_request",
     "update_request",
+    "resubmit_request",
     "submit_request",
     "withdraw_request",
     "request_return",
     "approve_request",
     "reject_request",
     "request_changes",
+    "contract_create_draft",
+    "contract_update_draft",
+    "contract_add_attachment",
+    "contract_submit",
+    "contract_withdraw",
+    "contract_approve",
+    "contract_reject",
+    "contract_delegate",
 }
+
+CONTRACT_ACTIONS = {
+    "contract_list_legal_entities",
+    "contract_list_my_applications",
+    "contract_get_application",
+    "contract_get_history",
+    "contract_list_pending_approvals",
+    *WRITE_ACTIONS.intersection({
+        "contract_create_draft",
+        "contract_update_draft",
+        "contract_add_attachment",
+        "contract_submit",
+        "contract_withdraw",
+        "contract_approve",
+        "contract_reject",
+        "contract_delegate",
+    }),
+}
+COMMON_APPLICATION_ACTIONS = {
+    "list_my_requests",
+    "get_request",
+    "create_extra_request",
+    "create_and_submit_extra_request",
+    "update_request",
+    "resubmit_request",
+    "submit_request",
+    "withdraw_request",
+    "list_my_approvals",
+    "approve_request",
+    "reject_request",
+    "request_changes",
+}
+ASSET_REQUEST_BUSINESS_TYPE = "asset_request"
+ASSET_REQUEST_FORM_KEY = "asset_request"
 
 
 class ClientError(Exception):
@@ -169,6 +215,63 @@ def broker_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ClientError("INVALID_RESPONSE", "OA returned an invalid authentication response")
     return result
+
+
+def api_json(
+    path: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    headers = {
+        "authorization": f"Bearer {active_id_token()}",
+        "content-type": "application/json",
+        "x-oa-source": "skill",
+    }
+    if idempotency_key:
+        headers["idempotency-key"] = idempotency_key
+    request = urllib.request.Request(
+        f"{API_URL}{path}",
+        data=None if payload is None else json.dumps(payload, ensure_ascii=False).encode(),
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        try:
+            body = json.loads(error.read().decode())
+            detail = body.get("error", body) if isinstance(body, dict) else {}
+            code = str(detail.get("code", "HTTP_ERROR")) if isinstance(detail, dict) else "HTTP_ERROR"
+            message = str(detail.get("message", "OA request failed")) if isinstance(detail, dict) else "OA request failed"
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            code, message = "HTTP_ERROR", "OA request failed"
+        raise ClientError(code, message) from None
+    except urllib.error.URLError as error:
+        raise ClientError("NETWORK_ERROR", f"Unable to reach OA: {error.reason}") from None
+    if not isinstance(result, dict):
+        raise ClientError("INVALID_RESPONSE", "OA returned an invalid response")
+    return result
+
+
+def device_request_mode() -> str:
+    configured = os.environ.get("TODAY_OA_DEVICE_REQUEST_MODE", "auto").strip().lower()
+    if configured in {"legacy", "common"}:
+        return configured
+    if configured != "auto":
+        raise ClientError("INVALID_CONFIGURATION", "TODAY_OA_DEVICE_REQUEST_MODE must be auto, legacy, or common")
+    request = urllib.request.Request(f"{API_URL}/v1/company-assets/meta", method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            metadata = json.loads(response.read().decode())
+    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ClientError("MODE_DISCOVERY_FAILED", f"Unable to determine the device request mode: {error}") from None
+    mode = metadata.get("requestWriteMode") if isinstance(metadata, dict) else None
+    if mode not in {"legacy", "common"}:
+        raise ClientError("INVALID_RESPONSE", "OA returned an invalid device request mode")
+    return str(mode)
 
 
 def write_private(path: Path, payload: dict[str, Any]) -> None:
@@ -418,26 +521,30 @@ def apply_update() -> dict[str, Any]:
     return {"status": "updated", "previousVersion": current, "version": latest}
 
 
-def execute(action_input: dict[str, Any]) -> dict[str, Any]:
-    action_input = dict(action_input)
-    action = action_input.get("action")
-    if not isinstance(action, str):
-        raise ClientError("INVALID_INPUT", "action is required")
-    is_write = action in WRITE_ACTIONS
-    confirmed = action_input.get("confirmed") is True
-    confirmation_token = action_input.pop("confirmationToken", None)
-    if is_write and confirmed and not isinstance(confirmation_token, str):
-        raise ClientError("CONFIRMATION_REQUIRED", "confirmationToken is required for a confirmed write")
-    if is_write and confirmed:
-        validate_confirmation(confirmation_token, action_input)
+def confirmation_summary(action_input: dict[str, Any]) -> dict[str, Any]:
+    action = action_input["action"]
+    fields = {
+        "create_extra_request": ("purpose", "expectedDate", "items"),
+        "create_and_submit_extra_request": ("purpose", "expectedDate", "items"),
+        "update_request": ("requestId", "purpose", "expectedDate", "items"),
+        "resubmit_request": ("requestId", "purpose", "expectedDate", "items"),
+        "submit_request": ("requestId",),
+        "withdraw_request": ("requestId", "comment"),
+        "request_return": ("assetId",),
+        "approve_request": ("taskId",),
+        "reject_request": ("taskId", "comment"),
+        "request_changes": ("taskId", "comment"),
+    }.get(action, ())
+    return {field: action_input[field] for field in fields if field in action_input}
 
+def legacy_execute(action_input: dict[str, Any], confirmed: bool, confirmation_token: str | None) -> dict[str, Any]:
     body = json.dumps({**action_input, "confirmed": confirmed}, ensure_ascii=False).encode()
     headers = {
         "authorization": f"Bearer {active_id_token()}",
         "content-type": "application/json",
         "x-oa-source": "skill",
     }
-    if is_write and confirmed:
+    if confirmed and confirmation_token:
         headers["idempotency-key"] = f"skill:{confirmation_token}"
     request = urllib.request.Request(
         f"{API_URL}/v1/company-assets/integrations/today/company-asset",
@@ -459,12 +566,320 @@ def execute(action_input: dict[str, Any]) -> dict[str, Any]:
         raise ClientError("NETWORK_ERROR", f"Unable to reach OA: {error.reason}") from None
     if not isinstance(result, dict):
         raise ClientError("INVALID_RESPONSE", "OA returned an invalid response")
+    return result
+
+
+def common_request_data(action_input: dict[str, Any], current: dict[str, Any] | None = None) -> dict[str, Any]:
+    existing = current.get("data", {}) if isinstance(current, dict) else {}
+    data = dict(existing) if isinstance(existing, dict) else {}
+    for source, target in (("purpose", "purpose"), ("expectedDate", "expectedDate"), ("items", "items")):
+        if source in action_input:
+            data[target] = action_input[source]
+    return data
+
+
+def common_execute(action_input: dict[str, Any], confirmation_token: str | None) -> dict[str, Any]:
+    action = action_input["action"]
+    limit = int(action_input.get("limit", 50))
+    offset = int(action_input.get("offset", 0))
+    if action == "list_my_requests":
+        current = api_json(f"/v1/oa/applications?limit={limit}&offset={offset}")
+        legacy = legacy_execute(action_input, False, None)
+        return {
+            "items": current.get("items", []),
+            "legacyItems": legacy.get("items", []),
+            "pagination": current.get("pagination", {"limit": limit, "offset": offset}),
+            "historyCompatibility": "legacyItems are read-only historical device requests",
+        }
+    if action == "get_request":
+        request_id = str(action_input.get("requestId", ""))
+        try:
+            result = api_json(f"/v1/oa/applications/{urllib.parse.quote(request_id)}")
+            result["history"] = api_json(f"/v1/oa/applications/{urllib.parse.quote(request_id)}/history").get("items", [])
+            return result
+        except ClientError as error:
+            if error.code != "NOT_FOUND":
+                raise
+            return legacy_execute(action_input, False, None)
+    if action == "list_my_approvals":
+        return api_json(f"/v1/oa/approvals/pending?limit={limit}&offset={offset}")
+
+    key = f"skill:{confirmation_token}"
+    request_id = str(action_input.get("requestId", ""))
+    if action in {"create_extra_request", "create_and_submit_extra_request"}:
+        created = api_json(
+            f"/v1/oa/applications/{ASSET_REQUEST_BUSINESS_TYPE}",
+            method="POST",
+            payload={
+                "data": common_request_data(action_input),
+                "summary": str(action_input.get("purpose", "")),
+            },
+            idempotency_key=f"{key}:create",
+        )
+        if action == "create_extra_request":
+            return created
+        application_id = str(created.get("id", ""))
+        if not application_id:
+            raise ClientError("INVALID_RESPONSE", "OA did not return an application id")
+        return api_json(
+            f"/v1/oa/applications/{urllib.parse.quote(application_id)}/submit",
+            method="POST",
+            idempotency_key=f"{key}:submit",
+        )
+    if action in {"update_request", "resubmit_request"}:
+        current = api_json(f"/v1/oa/applications/{urllib.parse.quote(request_id)}")
+        payload = {
+            "data": common_request_data(action_input, current),
+            "summary": str(action_input.get("purpose", current.get("summary", ""))),
+        }
+        endpoint = "resubmit" if action == "resubmit_request" else "draft"
+        method = "POST" if action == "resubmit_request" else "PUT"
+        return api_json(
+            f"/v1/oa/applications/{urllib.parse.quote(request_id)}/{endpoint}",
+            method=method,
+            payload=payload,
+            idempotency_key=key,
+        )
+    if action == "submit_request":
+        return api_json(
+            f"/v1/oa/applications/{urllib.parse.quote(request_id)}/submit",
+            method="POST",
+            idempotency_key=key,
+        )
+    if action == "withdraw_request":
+        payload = {"reason": action_input["comment"]} if action_input.get("comment") else {}
+        return api_json(
+            f"/v1/oa/applications/{urllib.parse.quote(request_id)}/withdraw",
+            method="POST",
+            payload=payload,
+            idempotency_key=key,
+        )
+    if action in {"approve_request", "reject_request", "request_changes"}:
+        approval_action = {
+            "approve_request": "approve",
+            "reject_request": "reject",
+            "request_changes": "request_changes",
+        }[action]
+        payload = {"action": approval_action}
+        if action_input.get("comment"):
+            payload["reason"] = action_input["comment"]
+        return api_json(
+            f"/v1/oa/approvals/{urllib.parse.quote(str(action_input.get('taskId', '')))}/actions",
+            method="POST",
+            payload=payload,
+            idempotency_key=key,
+        )
+    raise ClientError("INVALID_INPUT", f"Action {action} is not supported in common request mode")
+
+
+def execute(action_input: dict[str, Any]) -> dict[str, Any]:
+    action_input = dict(action_input)
+    action = action_input.get("action")
+    if not isinstance(action, str):
+        raise ClientError("INVALID_INPUT", "action is required")
+    is_write = action in WRITE_ACTIONS
+    confirmed = action_input.get("confirmed") is True
+    confirmation_token = action_input.pop("confirmationToken", None)
+    if is_write and confirmed and not isinstance(confirmation_token, str):
+        raise ClientError("CONFIRMATION_REQUIRED", "confirmationToken is required for a confirmed write")
+    if is_write and confirmed:
+        validate_confirmation(confirmation_token, action_input)
+    if action in CONTRACT_ACTIONS:
+        if is_write and not confirmed:
+            result = {
+                "status": "confirmation_required",
+                "summary": contract_confirmation_summary(action, action_input),
+            }
+        else:
+            result = execute_contract_action(action, action_input, confirmation_token)
+        if is_write and not confirmed:
+            result["confirmationToken"] = secrets.token_hex(16)
+            record_confirmation(result["confirmationToken"], action_input)
+        if is_write and confirmed:
+            consume_confirmation(confirmation_token)
+        return result
+    mode = device_request_mode() if action in COMMON_APPLICATION_ACTIONS else "legacy"
+    if mode == "common" and is_write and not confirmed:
+        result = {
+            "status": "confirmation_required",
+            "action": action,
+            "summary": confirmation_summary(action_input),
+            "requestWriteMode": "common",
+        }
+    elif mode == "common":
+        result = common_execute(action_input, confirmation_token)
+    else:
+        if action == "resubmit_request":
+            raise ClientError("ACTION_NOT_AVAILABLE", "Resubmit is available after OA switches device requests to common mode")
+        result = legacy_execute(action_input, confirmed, confirmation_token)
     if is_write and not confirmed and result.get("status") == "confirmation_required":
         result["confirmationToken"] = secrets.token_hex(16)
         record_confirmation(result["confirmationToken"], action_input)
     if is_write and confirmed:
         consume_confirmation(confirmation_token)
     return result
+
+
+def required_string(action_input: dict[str, Any], field: str) -> str:
+    value = action_input.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ClientError("INVALID_INPUT", f"{field} is required")
+    return value.strip()
+
+
+def positive_page_value(action_input: dict[str, Any], field: str, default: int, maximum: int) -> int:
+    value = action_input.get(field, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > maximum:
+        raise ClientError("INVALID_INPUT", f"{field} must be an integer between 0 and {maximum}")
+    return value
+
+
+def contract_confirmation_summary(action: str, action_input: dict[str, Any]) -> dict[str, Any]:
+    summaries = {
+        "contract_create_draft": "新建合同草稿",
+        "contract_update_draft": "更新合同草稿",
+        "contract_add_attachment": "登记合同附件新版本",
+        "contract_submit": "提交合同审批",
+        "contract_withdraw": "撤回并取消合同申请",
+        "contract_approve": "通过合同审批",
+        "contract_reject": "驳回并终止合同审批",
+        "contract_delegate": "将合同审批转签给他人",
+    }
+    summary: dict[str, Any] = {"operation": summaries[action]}
+    for field in ("applicationId", "taskId", "reason"):
+        if field in action_input:
+            summary[field] = action_input[field]
+    if action == "contract_create_draft" or action == "contract_update_draft":
+        data = action_input.get("data")
+        if isinstance(data, dict):
+            summary.update({
+                "title": data.get("title"),
+                "contractType": data.get("contract_type"),
+                "counterparty": data.get("counterparty"),
+                "contractValue": data.get("contract_value"),
+            })
+    if action == "contract_add_attachment":
+        attachment = action_input.get("attachment")
+        if isinstance(attachment, dict):
+            summary["attachment"] = {
+                "fileName": attachment.get("fileName"),
+                "category": attachment.get("category"),
+                "storageProvider": attachment.get("storageProvider"),
+            }
+    if action == "contract_delegate":
+        summary["targetEmployeeId"] = action_input.get("targetEmployeeId")
+    return summary
+
+
+def execute_contract_action(action: str, action_input: dict[str, Any], confirmation_token: str | None) -> dict[str, Any]:
+    application_id = urllib.parse.quote(str(action_input.get("applicationId", "")), safe="")
+    task_id = urllib.parse.quote(str(action_input.get("taskId", "")), safe="")
+    method = "GET"
+    path = ""
+    body: dict[str, Any] | None = None
+
+    if action == "contract_list_legal_entities":
+        path = "/v1/contracts/legal-entities"
+    elif action == "contract_list_my_applications":
+        limit = positive_page_value(action_input, "limit", 20, 100)
+        offset = positive_page_value(action_input, "offset", 0, 1_000_000)
+        path = f"/v1/contracts/applications?{urllib.parse.urlencode({'limit': limit, 'offset': offset})}"
+    elif action == "contract_list_pending_approvals":
+        limit = positive_page_value(action_input, "limit", 20, 100)
+        offset = positive_page_value(action_input, "offset", 0, 1_000_000)
+        path = f"/v1/contracts/approvals/pending?{urllib.parse.urlencode({'limit': limit, 'offset': offset})}"
+    elif action == "contract_get_application":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        path = f"/v1/contracts/applications/{application_id}"
+    elif action == "contract_get_history":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        path = f"/v1/contracts/applications/{application_id}/history"
+    elif action == "contract_create_draft":
+        method, path = "POST", "/v1/contracts/drafts"
+        body = contract_draft_body(action_input)
+    elif action == "contract_update_draft":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        method, path = "PUT", f"/v1/contracts/applications/{application_id}/draft"
+        body = contract_draft_body(action_input)
+    elif action == "contract_add_attachment":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        attachment = action_input.get("attachment")
+        if not isinstance(attachment, dict):
+            raise ClientError("INVALID_INPUT", "attachment is required")
+        method, path, body = "POST", f"/v1/contracts/applications/{application_id}/attachments", attachment
+    elif action == "contract_submit":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        method, path, body = "POST", f"/v1/contracts/applications/{application_id}/submit", {}
+    elif action == "contract_withdraw":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        method, path = "POST", f"/v1/contracts/applications/{application_id}/withdraw"
+        body = {"reason": action_input["reason"]} if action_input.get("reason") else {}
+    elif action in {"contract_approve", "contract_reject"}:
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        task_id = urllib.parse.quote(required_string(action_input, "taskId"), safe="")
+        decision = "approve" if action == "contract_approve" else "reject"
+        body = {"action": decision}
+        if action_input.get("reason"):
+            body["reason"] = action_input["reason"]
+        if decision == "reject" and not action_input.get("reason"):
+            raise ClientError("INVALID_INPUT", "reason is required for contract rejection")
+        method, path = "POST", f"/v1/contracts/applications/{application_id}/approvals/{task_id}/actions"
+    elif action == "contract_delegate":
+        application_id = urllib.parse.quote(required_string(action_input, "applicationId"), safe="")
+        task_id = urllib.parse.quote(required_string(action_input, "taskId"), safe="")
+        method, path = "POST", f"/v1/contracts/applications/{application_id}/approvals/{task_id}/assignment"
+        body = {
+            "action": "delegate",
+            "targetEmployeeId": required_string(action_input, "targetEmployeeId"),
+            "reason": required_string(action_input, "reason"),
+        }
+    else:
+        raise ClientError("INVALID_ACTION", "Unsupported contract action")
+
+    headers = {
+        "authorization": f"Bearer {active_id_token()}",
+        "accept": "application/json",
+        "x-oa-source": "skill",
+    }
+    encoded = None
+    if body is not None:
+        headers["content-type"] = "application/json"
+        encoded = json.dumps(body, ensure_ascii=False).encode()
+    if confirmation_token:
+        headers["idempotency-key"] = f"skill:{confirmation_token}"
+    request = urllib.request.Request(f"{API_URL}{path}", data=encoded, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        try:
+            payload = json.loads(error.read().decode())
+            detail = payload.get("error", payload) if isinstance(payload, dict) else {}
+            if isinstance(detail, dict):
+                raise ClientError(str(detail.get("code", "HTTP_ERROR")), str(detail.get("message", "OA request failed")))
+            raise ClientError("HTTP_ERROR", str(detail))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise ClientError("HTTP_ERROR", "OA request failed") from None
+    except urllib.error.URLError as error:
+        raise ClientError("NETWORK_ERROR", f"Unable to reach OA: {error.reason}") from None
+    if not isinstance(result, dict):
+        raise ClientError("INVALID_RESPONSE", "OA returned an invalid response")
+    return result
+
+
+def contract_draft_body(action_input: dict[str, Any]) -> dict[str, Any]:
+    data = action_input.get("data")
+    if not isinstance(data, dict):
+        raise ClientError("INVALID_INPUT", "data is required")
+    forbidden = {"handler_employee_id", "business_owner_employee_id"}.intersection(data)
+    if forbidden:
+        raise ClientError("IDENTITY_FIELD_FORBIDDEN", "Employee identity fields are filled by OA from the verified login")
+    body: dict[str, Any] = {"data": data}
+    if "summary" in action_input:
+        body["summary"] = action_input["summary"]
+    if "deepLink" in action_input:
+        body["deepLink"] = action_input["deepLink"]
+    return body
 
 
 def parse_arguments() -> argparse.Namespace:
